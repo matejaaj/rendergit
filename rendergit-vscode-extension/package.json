@@ -1,0 +1,108 @@
+{
+  "name": "rendergit-copy-for-llm",
+  "displayName": "RenderGit - Copy for LLM",
+  "description": "Copy selected files and folders from the Explorer into an LLM-friendly CXML format.",
+  "version": "0.0.1",
+  "publisher": "matejaaj",
+  "license": "0BSD",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/matejaaj/rendergit.git",
+    "directory": "rendergit-vscode-extension"
+  },
+  "bugs": {
+    "url": "https://github.com/matejaaj/rendergit/issues"
+  },
+  "homepage": "https://github.com/matejaaj/rendergit/tree/master/rendergit-vscode-extension",
+  "engines": {
+    "vscode": "^1.74.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "extensionKind": [
+    "workspace"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "rendergit.copyContentForLLM",
+        "title": "Copy content for LLM",
+        "category": "RenderGit",
+        "icon": "$(copy)"
+      }
+    ],
+    "menus": {
+      "explorer/context": [
+        {
+          "command": "rendergit.copyContentForLLM",
+          "group": "5_cutcopypaste"
+        }
+      ],
+      "commandPalette": [
+        {
+          "command": "rendergit.copyContentForLLM"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "RenderGit",
+      "properties": {
+        "rendergit.maxBytes": {
+          "type": "number",
+          "default": 102400,
+          "minimum": 1,
+          "description": "Maximum file size in bytes to include in the copied LLM payload. Larger files are skipped. Default is 100KB."
+        },
+        "rendergit.excludeDirNames": {
+          "type": "array",
+          "default": [
+            "bin",
+            "obj",
+            "Debug",
+            "Release",
+            "node_modules",
+            "dist",
+            "build",
+            "out",
+            ".venv",
+            "venv",
+            "__pycache__",
+            ".idea",
+            ".vscode",
+            ".next",
+            ".nuxt",
+            "target",
+            ".git"
+          ],
+          "items": {
+            "type": "string"
+          },
+          "description": "Directory names to skip recursively while traversing selected folders. .git is always skipped."
+        },
+        "rendergit.includeProjectTree": {
+          "type": "boolean",
+          "default": true,
+          "description": "When enabled, prepend a simple project tree above the CXML output."
+        },
+        "rendergit.convertNotebooks": {
+          "type": "boolean",
+          "default": true,
+          "description": "Convert .ipynb notebooks into Python-like text with # %% cell markers before copying."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.74.0",
+    "@vscode/vsce": "^3.9.1",
+    "typescript": "^5.6.3"
+  }
+}

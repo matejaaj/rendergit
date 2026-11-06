@@ -12,58 +12,35 @@ Before AI coding agents became part of my workflow, I used rendergit every day t
 - **CLI exclusions:** use the repeatable `--exclude` option to skip directory names, relative paths, or glob patterns. Common dependency and build directories such as `node_modules`, `.venv`, and `dist` are skipped by default, and excluded directories are pruned during scanning.
 - **[VS Code extension](rendergit-vscode-extension/):** select files or folders in the Explorer, right-click, and choose **Copy content for LLM** to copy their contents as CXML directly to the clipboard. It also supports an optional tree of the selection and converts Jupyter notebooks into readable cell-based text, leaving out notebook outputs.
 
-![VS Code Explorer context menu showing Copy content for LLM](docs/images/vscode-copy-for-llm.png)
+## CLI
 
-The original HTML viewer and Human/LLM views are described below.
-
-## Overview
-
-> Just show me the code.
-
-Tired of clicking around complex file hierarchies of GitHub repos? Do you just want to see all of the code on a single page? Enter `rendergit`. Flatten any GitHub repository into a single, static HTML page with syntax highlighting, markdown rendering, and a clean sidebar navigation. Perfect for code review, exploration, and an instant Ctrl+F experience.
-
-## Basic usage
-
-Install and use easily with [uv](https://docs.astral.sh/uv/):
+Requires [uv](https://docs.astral.sh/uv/) and Git.
 
 ```bash
 uv tool install git+https://github.com/matejaaj/rendergit
-rendergit https://github.com/karpathy/nanogpt
-rendergit . --exclude 'src/generated/**' --exclude 'coverage'
+rendergit .                             # local project
+rendergit https://github.com/karpathy/nanoGPT
+rendergit . --exclude 'src/generated/**' # optional exclusions
 ```
 
-Alternatively, more manual pip install example:
+Opens a single HTML page in your browser: **Human View** for browsing, **LLM View** for copying code into a chat. Run `rendergit --help` for more options.
+
+## VS Code extension
+
+Requires VS Code, Git, and Node.js 22+ (with npm).
 
 ```bash
 git clone https://github.com/matejaaj/rendergit
-cd rendergit
-pip install -e .
-rendergit https://github.com/karpathy/nanoGPT
+cd rendergit/rendergit-vscode-extension
+npm ci
+npx vsce package --no-dependencies
 ```
 
-The code will:
-1. Use the local directory, or clone the remote repo to a temporary directory
-2. Render its source code into a single static temporary HTML file
-3. Automatically open the file in your browser
+In VS Code, open the Command Palette → **Extensions: Install from VSIX…** → select the generated `.vsix` file in `rendergit-vscode-extension`.
 
-Once open, you can toggle between two views:
-- **👤 Human View**: Browse with syntax highlighting, sidebar navigation, visual goodies
-- **🤖 LLM View**: Copy the entire codebase as CXML text to paste into Claude, ChatGPT, etc.
+Select files or folders in the Explorer → right-click → **Copy content for LLM** → paste into your chat.
 
-There's a few other smaller options, see the code.
-
-## Features
-
-- **Dual view modes** - toggle between Human and LLM views
-  - **👤 Human View**: Pretty interface with syntax highlighting and navigation
-  - **🤖 LLM View**: Raw CXML text format - perfect for copying to Claude/ChatGPT for code analysis
-- **Syntax highlighting** for code files via Pygments
-- **Markdown rendering** for README files and docs
-- **Smart filtering** - skips binaries and oversized files
-- **Directory tree** overview at the top
-- **Sidebar navigation** with file links and sizes
-- **Responsive design** that works on mobile
-- **Search-friendly** - use Ctrl+F to find anything across all files
+![VS Code Explorer context menu showing Copy content for LLM](docs/images/vscode-copy-for-llm.png)
 
 ## Contributing
 

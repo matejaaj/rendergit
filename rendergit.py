@@ -1,10 +1,17 @@
 #!/usr/bin/env python3
 """
 Flatten a GitHub repo into a single static HTML page for fast skimming and Ctrl+F.
+
+Adds:
+  - --exclude (repeatable) to exclude extra folders/paths/globs
+  - default excluded dir names (bin/obj/node_modules/etc.)
+  - directory pruning via os.walk for speed
 """
 
 from __future__ import annotations
+
 import argparse
+import fnmatch
 import html
 import os
 import pathlib
@@ -14,15 +21,16 @@ import sys
 import tempfile
 import webbrowser
 from dataclasses import dataclass
-from typing import List
+from typing import List, Tuple
 
 # External deps
 from pygments import highlight
 from pygments.formatters import HtmlFormatter
-from pygments.lexers import get_lexer_for_filename, TextLexer
+from pygments.lexers import TextLexer, get_lexer_for_filename
 import markdown
 
 MAX_DEFAULT_BYTES = 50 * 1024
+
 BINARY_EXTENSIONS = {
     ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg", ".ico",
     ".pdf", ".zip", ".tar", ".gz", ".bz2", ".xz", ".7z", ".rar",
@@ -30,12 +38,26 @@ BINARY_EXTENSIONS = {
     ".ttf", ".otf", ".eot", ".woff", ".woff2",
     ".so", ".dll", ".dylib", ".class", ".jar", ".exe", ".bin",
 }
+
 MARKDOWN_EXTENSIONS = {".md", ".markdown", ".mdown", ".mkd", ".mkdn"}
+
+# Exclude these directory names everywhere by default
+DEFAULT_EXCLUDE_DIR_NAMES = {
+    "bin", "obj",
+    "Debug", "Release",
+    "node_modules", "dist", "build", "out",
+    ".venv", "venv", "__pycache__",
+    ".idea", ".vscode",
+    ".next", ".nuxt",
+    "target",
+}
+
 
 @dataclass
 class RenderDecision:
     include: bool
-    reason: str  # "ok" | "binary" | "too_large" | "ignored"
+    reason: str  # "ok" | "binary" | "too_large" | "ignored" | "excluded"
+
 
 @dataclass
 class FileInfo:
@@ -71,8 +93,7 @@ def bytes_human(n: int) -> str:
         i += 1
     if i == 0:
         return f"{int(f)} {units[i]}"
-    else:
-        return f"{f:.1f} {units[i]}"
+    return f"{f:.1f} {units[i]}"
 
 
 def looks_binary(path: pathlib.Path) -> bool:
@@ -95,36 +116,154 @@ def looks_binary(path: pathlib.Path) -> bool:
         return True
 
 
-def decide_file(path: pathlib.Path, repo_root: pathlib.Path, max_bytes: int) -> FileInfo:
+def _normalize_rel(s: str) -> str:
+    s = s.strip().replace("\\", "/")
+    while s.startswith("./"):
+        s = s[2:]
+    return s.strip("/")
+
+
+def parse_excludes(exclude_args: List[str]) -> Tuple[set[str], list[str]]:
+    """
+    Returns:
+      - exclude_dir_names: bare names (no slash/glob) that should be excluded anywhere in the tree
+      - exclude_globs: glob patterns matched against repo-relative paths (POSIX style)
+
+    Supported:
+      --exclude node_modules
+      --exclude "bin,obj,dist"
+      --exclude "src/generated/**"
+      --exclude "**/*.min.js"
+    """
+    exclude_dir_names: set[str] = set()
+    exclude_globs: list[str] = []
+
+    for raw in exclude_args:
+        # allow CSV
+        parts = [p.strip() for p in raw.split(",") if p.strip()]
+        for p in parts:
+            p = _normalize_rel(p)
+            if not p:
+                continue
+
+            has_glob = any(ch in p for ch in ("*", "?", "["))
+            has_slash = "/" in p
+
+            # If it looks like a path (contains slash) OR has glob chars, treat as glob
+            if has_slash or has_glob:
+                # If user passed a directory path without a glob, make it "that dir and everything under it"
+                if not has_glob:
+                    exclude_globs.append(p)
+                    exclude_globs.append(p + "/**")
+                else:
+                    exclude_globs.append(p)
+            else:
+                # Bare name => exclude any directory with that name, anywhere
+                exclude_dir_names.add(p)
+
+    return exclude_dir_names, exclude_globs
+
+
+def is_excluded_rel(rel: str, exclude_dir_names: set[str], exclude_globs: list[str]) -> bool:
+    rel = rel.replace("\\", "/").strip("/")
+    parts = rel.split("/") if rel else []
+
+    # If any ancestor dir matches excluded name => excluded
+    # (e.g. anything under node_modules/)
+    if any(part in exclude_dir_names for part in parts[:-1]):
+        return True
+
+    # Glob match against full rel path
+    for pat in exclude_globs:
+        if fnmatch.fnmatch(rel, pat):
+            return True
+
+    return False
+
+
+def decide_file(
+    path: pathlib.Path,
+    repo_root: pathlib.Path,
+    max_bytes: int,
+    exclude_dir_names: set[str],
+    exclude_globs: list[str],
+) -> FileInfo:
     rel = str(path.relative_to(repo_root)).replace(os.sep, "/")
     try:
         size = path.stat().st_size
     except FileNotFoundError:
         size = 0
-    # Ignore VCS and build junk
+
+    # Ignore VCS
     if "/.git/" in f"/{rel}/" or rel.startswith(".git/"):
         return FileInfo(path, rel, size, RenderDecision(False, "ignored"))
+
+    # User + default excludes
+    if is_excluded_rel(rel, exclude_dir_names, exclude_globs):
+        return FileInfo(path, rel, size, RenderDecision(False, "excluded"))
+
     if size > max_bytes:
         return FileInfo(path, rel, size, RenderDecision(False, "too_large"))
+
     if looks_binary(path):
         return FileInfo(path, rel, size, RenderDecision(False, "binary"))
+
     return FileInfo(path, rel, size, RenderDecision(True, "ok"))
 
 
-def collect_files(repo_root: pathlib.Path, max_bytes: int) -> List[FileInfo]:
+def collect_files(
+    repo_root: pathlib.Path,
+    max_bytes: int,
+    exclude_dir_names: set[str],
+    exclude_globs: list[str],
+) -> List[FileInfo]:
     infos: List[FileInfo] = []
-    for p in sorted(repo_root.rglob("*")):
-        if p.is_symlink():
-            continue
-        if p.is_file():
-            infos.append(decide_file(p, repo_root, max_bytes))
+
+    # Use os.walk so we can prune directories (much faster than rglob for big repos)
+    for dirpath, dirnames, filenames in os.walk(repo_root):
+        dp = pathlib.Path(dirpath)
+
+        rel_dir = str(dp.relative_to(repo_root)).replace(os.sep, "/")
+        if rel_dir == ".":
+            rel_dir = ""
+        rel_dir = rel_dir.strip("/")
+
+        # prune dirs in-place
+        kept: list[str] = []
+        for d in dirnames:
+            if d == ".git":
+                continue
+
+            # exclude by directory name (default + user)
+            if d in exclude_dir_names:
+                continue
+
+            child_rel = f"{rel_dir}/{d}" if rel_dir else d
+
+            # exclude by glob/path
+            # Also check child_rel + "/x" so patterns like "src/generated/**" prune the dir.
+            if is_excluded_rel(child_rel, exclude_dir_names, exclude_globs) or is_excluded_rel(
+                child_rel + "/x", exclude_dir_names, exclude_globs
+            ):
+                continue
+
+            kept.append(d)
+
+        dirnames[:] = kept
+
+        for fn in sorted(filenames):
+            p = dp / fn
+            if p.is_symlink() or not p.is_file():
+                continue
+            infos.append(decide_file(p, repo_root, max_bytes, exclude_dir_names, exclude_globs))
+
+    infos.sort(key=lambda i: i.rel.lower())
     return infos
 
 
 def generate_tree_fallback(root: pathlib.Path) -> str:
     """Minimal tree-like output if `tree` command is missing."""
     lines: List[str] = []
-    prefix_stack: List[str] = []
 
     def walk(dir_path: pathlib.Path, prefix: str = ""):
         entries = [e for e in dir_path.iterdir() if e.name != ".git"]
@@ -202,14 +341,17 @@ def generate_cxml_text(infos: List[FileInfo], repo_dir: pathlib.Path) -> str:
 
 def build_html(repo_url: str, repo_dir: pathlib.Path, head_commit: str, infos: List[FileInfo]) -> str:
     formatter = HtmlFormatter(nowrap=False)
-    pygments_css = formatter.get_style_defs('.highlight')
+    pygments_css = formatter.get_style_defs(".highlight")
 
     # Stats
     rendered = [i for i in infos if i.decision.include]
     skipped_binary = [i for i in infos if i.decision.reason == "binary"]
     skipped_large = [i for i in infos if i.decision.reason == "too_large"]
     skipped_ignored = [i for i in infos if i.decision.reason == "ignored"]
-    total_files = len(rendered) + len(skipped_binary) + len(skipped_large) + len(skipped_ignored)
+    skipped_excluded = [i for i in infos if i.decision.reason == "excluded"]
+
+    total_files = len(infos)
+    skipped_total = total_files - len(rendered)
 
     # Directory tree
     tree_text = try_tree_command(repo_dir)
@@ -242,13 +384,16 @@ def build_html(repo_url: str, repo_dir: pathlib.Path, head_commit: str, infos: L
                 body_html = f'<div class="highlight">{code_html}</div>'
         except Exception as e:
             body_html = f'<pre class="error">Failed to render: {html.escape(str(e))}</pre>'
-        sections.append(f"""
+
+        sections.append(
+            f"""
 <section class="file-section" id="file-{anchor}">
   <h2>{html.escape(i.rel)} <span class="muted">({bytes_human(i.size)})</span></h2>
   <div class="file-body">{body_html}</div>
   <div class="back-top"><a href="#top">↑ Back to top</a></div>
 </section>
-""")
+"""
+        )
 
     # Skips lists
     def render_skip_list(title: str, items: List[FileInfo]) -> str:
@@ -265,11 +410,12 @@ def build_html(repo_url: str, repo_dir: pathlib.Path, head_commit: str, infos: L
         )
 
     skipped_html = (
-        render_skip_list("Skipped binaries", skipped_binary) +
-        render_skip_list("Skipped large files", skipped_large)
+        render_skip_list("Skipped excluded", skipped_excluded)
+        + render_skip_list("Skipped binaries", skipped_binary)
+        + render_skip_list("Skipped large files", skipped_large)
+        + render_skip_list("Skipped ignored", skipped_ignored)
     )
 
-    # HTML with left sidebar TOC
     return f"""
 <!DOCTYPE html>
 <html lang="en">
@@ -299,7 +445,7 @@ def build_html(repo_url: str, repo_dir: pathlib.Path, head_commit: str, infos: L
 
   .toc {{ list-style: none; padding-left: 0; margin: 0; overflow-x: auto; }}
   .toc li {{ padding: 0.15rem 0; white-space: nowrap; }}
-  .toc a {{ text-decoration: none; color: #0366d6; display: inline-block; text-decoration: none; }}
+  .toc a {{ text-decoration: none; color: #0366d6; display: inline-block; }}
   .toc a:hover {{ text-decoration: underline; }}
 
   main.container {{ padding-top: 1rem; }}
@@ -385,15 +531,17 @@ def build_html(repo_url: str, repo_dir: pathlib.Path, head_commit: str, infos: L
         <div><strong>Repository:</strong> <a href="{html.escape(repo_url)}">{html.escape(repo_url)}</a></div>
         <small><strong>HEAD commit:</strong> {html.escape(head_commit)}</small>
         <div class="counts">
-            <strong>Total files:</strong> {total_files} · <strong>Rendered:</strong> {len(rendered)} · <strong>Skipped:</strong> {len(skipped_binary) + len(skipped_large) + len(skipped_ignored)}
+            <strong>Total files:</strong> {total_files} ·
+            <strong>Rendered:</strong> {len(rendered)} ·
+            <strong>Skipped:</strong> {skipped_total}
         </div>
         </div>
     </section>
 
     <div class="view-toggle">
       <strong>View:</strong>
-      <button class="toggle-btn active" onclick="showHumanView()">👤 Human</button>
-      <button class="toggle-btn" onclick="showLLMView()">🤖 LLM</button>
+      <button class="toggle-btn active" onclick="showHumanView(event)">👤 Human</button>
+      <button class="toggle-btn" onclick="showLLMView(event)">🤖 LLM</button>
     </div>
 
     <div id="human-view">
@@ -429,18 +577,18 @@ def build_html(repo_url: str, repo_dir: pathlib.Path, head_commit: str, infos: L
 </div>
 
 <script>
-function showHumanView() {{
+function showHumanView(evt) {{
   document.getElementById('human-view').style.display = 'block';
   document.getElementById('llm-view').style.display = 'none';
   document.querySelectorAll('.toggle-btn').forEach(btn => btn.classList.remove('active'));
-  event.target.classList.add('active');
+  evt.target.classList.add('active');
 }}
 
-function showLLMView() {{
+function showLLMView(evt) {{
   document.getElementById('human-view').style.display = 'none';
   document.getElementById('llm-view').style.display = 'block';
   document.querySelectorAll('.toggle-btn').forEach(btn => btn.classList.remove('active'));
-  event.target.classList.add('active');
+  evt.target.classList.add('active');
 
   // Auto-select all text when switching to LLM view for easy copying
   setTimeout(() => {{
@@ -457,48 +605,75 @@ function showLLMView() {{
 
 def derive_temp_output_path(repo_url: str) -> pathlib.Path:
     """Derive a temporary output path from the repo URL."""
-    # Extract repo name from URL like https://github.com/owner/repo or https://github.com/owner/repo.git
-    parts = repo_url.rstrip('/').split('/')
+    parts = repo_url.rstrip("/").split("/")
     if len(parts) >= 2:
         repo_name = parts[-1]
-        if repo_name.endswith('.git'):
+        if repo_name.endswith(".git"):
             repo_name = repo_name[:-4]
         filename = f"{repo_name}.html"
     else:
         filename = "repo.html"
-
     return pathlib.Path(tempfile.gettempdir()) / filename
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Flatten a GitHub repo to a single HTML page")
-    ap.add_argument("repo_url", help="GitHub repo URL (https://github.com/owner/repo[.git])")
+    ap = argparse.ArgumentParser(description="Flatten a GitHub repo or local directory to a single HTML page")
+    ap.add_argument("repo_source", help="GitHub repo URL or local directory path")
     ap.add_argument("-o", "--out", help="Output HTML file path (default: temporary file derived from repo name)")
-    ap.add_argument("--max-bytes", type=int, default=MAX_DEFAULT_BYTES, help="Max file size to render (bytes); larger files are listed but skipped")
+    ap.add_argument(
+        "--max-bytes",
+        type=int,
+        default=MAX_DEFAULT_BYTES,
+        help="Max file size to render (bytes); larger files are listed but skipped",
+    )
     ap.add_argument("--no-open", action="store_true", help="Don't open the HTML file in browser after generation")
+    ap.add_argument(
+        "--exclude",
+        action="append",
+        default=[],
+        help="Exclude dirs/paths (repeatable). Examples: --exclude node_modules --exclude 'bin,obj' --exclude 'src/generated/**' --exclude '**/*.min.js'",
+    )
     args = ap.parse_args()
 
     # Set default output path if not provided
     if args.out is None:
-        args.out = str(derive_temp_output_path(args.repo_url))
+        args.out = str(derive_temp_output_path(args.repo_source))
 
-    tmpdir = tempfile.mkdtemp(prefix="flatten_repo_")
-    repo_dir = pathlib.Path(tmpdir, "repo")
+    source_path = pathlib.Path(args.repo_source)
+    is_local_repo = source_path.is_dir()
+    tmpdir = None  # Initialize tmpdir to None
 
-    try:
-        print(f"📁 Cloning {args.repo_url} to temporary directory: {repo_dir}", file=sys.stderr)
-        git_clone(args.repo_url, str(repo_dir))
+    if is_local_repo:
+        repo_dir = source_path.resolve()
+        # For a local repo, use the directory name as the "URL" in the report
+        repo_url = repo_dir.name
+        print(f"📁 Using local repository: {repo_dir}", file=sys.stderr)
+        head = git_head_commit(str(repo_dir))
+        print(f"✓ Local repo identified (HEAD: {head[:8]})", file=sys.stderr)
+    else:
+        # If not a local dir, assume it's a URL to be cloned
+        repo_url = args.repo_source
+        tmpdir = tempfile.mkdtemp(prefix="flatten_repo_")
+        repo_dir = pathlib.Path(tmpdir, "repo")
+        print(f"📁 Cloning {repo_url} to temporary directory: {repo_dir}", file=sys.stderr)
+        git_clone(repo_url, str(repo_dir))
         head = git_head_commit(str(repo_dir))
         print(f"✓ Clone complete (HEAD: {head[:8]})", file=sys.stderr)
 
+    try:
+        # Build exclude rules
+        user_ex_dir_names, user_ex_globs = parse_excludes(args.exclude)
+        exclude_dir_names = set(DEFAULT_EXCLUDE_DIR_NAMES) | set(user_ex_dir_names)
+        exclude_globs = user_ex_globs
+
         print(f"📊 Scanning files in {repo_dir}...", file=sys.stderr)
-        infos = collect_files(repo_dir, args.max_bytes)
+        infos = collect_files(repo_dir, args.max_bytes, exclude_dir_names, exclude_globs)
         rendered_count = sum(1 for i in infos if i.decision.include)
         skipped_count = len(infos) - rendered_count
         print(f"✓ Found {len(infos)} files total ({rendered_count} will be rendered, {skipped_count} skipped)", file=sys.stderr)
 
-        print(f"🔨 Generating HTML...", file=sys.stderr)
-        html_out = build_html(args.repo_url, repo_dir, head, infos)
+        print("🔨 Generating HTML...", file=sys.stderr)
+        html_out = build_html(repo_url, repo_dir, head, infos)
 
         out_path = pathlib.Path(args.out)
         print(f"💾 Writing HTML file: {out_path.resolve()}", file=sys.stderr)
@@ -510,11 +685,12 @@ def main() -> int:
             print(f"🌐 Opening {out_path} in browser...", file=sys.stderr)
             webbrowser.open(f"file://{out_path.resolve()}")
 
-        print(f"🗑️  Cleaning up temporary directory: {tmpdir}", file=sys.stderr)
         return 0
     finally:
-        shutil.rmtree(tmpdir, ignore_errors=True)
+        if tmpdir:
+            print(f"🗑️  Cleaning up temporary directory: {tmpdir}", file=sys.stderr)
+            shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
